@@ -1,4 +1,3 @@
-\
 #!/bin/sh
 # Capture DHCP Option 114 into /etc/remote-agent/dhcp114.url
 [ -n "$opt114" ] || exit 0

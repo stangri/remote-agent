@@ -1,4 +1,3 @@
-\
 #!/bin/sh
 # /usr/libexec/rpcd/provision
 # Implements list|call and supports discoverable adoption.
@@ -11,7 +10,7 @@ EXT_DIR="/usr/libexec/rpcd/provision.d"
 ADOPT_TOKEN_FILE="$STATE_DIR/adoption.token"
 DISCOVERABLE_FLAG="$STATE_DIR/discoverable.on"
 
-have() { command -v "$1" >/dev/null 2>&1; }
+is_installed() { command -v "$1" >/dev/null 2>&1; }
 read_stdin() { REQ="$(cat)"; }
 jget() { jsonfilter -s "$REQ" -e "$1" 2>/dev/null; }
 jarr() { jsonfilter -s "$REQ" -e "$1[*]" 2>/dev/null; }
@@ -38,7 +37,7 @@ JSON
 do_passwd() {
   u="$(jget '@.user')"; p="$(jget '@.password')"
   [ -n "$u" ] && [ -n "$p" ] || { err "missing user/password"; return; }
-  if have chpasswd; then
+  if is_installed chpasswd; then
     printf '%s:%s\n' "$u" "$p" | chpasswd && ok || err "chpasswd failed"
   else
     (echo "$p"; echo "$p") | passwd "$u" >/dev/null 2>&1 && ok || err "passwd failed"
@@ -86,7 +85,7 @@ do_reboot() {
 }
 
 pkg_driver() {
-  if have apk; then echo apk; elif have opkg; then echo opkg; else echo none; fi
+  if is_installed apk; then echo apk; elif is_installed opkg; then echo opkg; else echo none; fi
 }
 do_pkg() {
   act="$(jget '@.action')"
@@ -126,7 +125,7 @@ rotate_to_shadow() {
   RPC_USER="remote_agent"
   newpass="$1"
   [ -n "$newpass" ] || { err "new_password required"; return 1; }
-  if have chpasswd; then
+  if is_installed chpasswd; then
     printf '%s:%s\n' "$RPC_USER" "$newpass" | chpasswd
   else
     (echo "$newpass"; echo "$newpass") | passwd "$RPC_USER" >/dev/null

@@ -1,4 +1,0 @@
-config controller 'controller'
-    option controller_url ''     # If set, device calls home here. Example: https://192.168.1.1/cgi-bin/remote-controller/enroll
-    option ca  '/etc/ssl/certs/ca-certificates.crt'
-    option interval '300'

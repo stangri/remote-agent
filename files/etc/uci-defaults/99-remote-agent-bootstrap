@@ -1,10 +1,10 @@
-\
 #!/bin/sh
-# 99-remote-agent-bootstrap: first-boot setup
+
 set -e
 RPC_USER="remote_agent"
 STATE_DIR="/etc/remote-agent"
 CRED_JSON="$STATE_DIR/credentials.json"
+# shellcheck disable=SC2034
 ADOPTED_FLAG="$STATE_DIR/adopted.ok"
 ADOPT_TOKEN_FILE="$STATE_DIR/adoption.token"
 
