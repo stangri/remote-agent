@@ -1,0 +1,7 @@
+{
+  "remote-agent": {
+    "description": "Remote agent provisioning API",
+    "read":  { "ubus": { "provision": [ "ping", "bootstrap_info" ] } },
+    "write": { "ubus": { "provision": [ "passwd", "uci", "service", "wifi", "reboot", "pkg", "adopt" ] } }
+  }
+}

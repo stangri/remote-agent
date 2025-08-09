@@ -1,0 +1,9 @@
+\
+#!/bin/sh
+# Capture DHCP Option 114 into /etc/remote-agent/dhcp114.url
+[ -n "$opt114" ] || exit 0
+STATE_DIR="/etc/remote-agent"
+mkdir -p "$STATE_DIR"
+echo "$opt114" > "$STATE_DIR/dhcp114.url"
+chmod 600 "$STATE_DIR/dhcp114.url"
+/etc/init.d/remote-agent-enroll restart >/dev/null 2>&1 || true

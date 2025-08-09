@@ -1,0 +1,100 @@
+\
+#!/bin/sh /etc/rc.common
+START=95
+USE_PROCD=1
+
+STATE_DIR="/etc/remote-agent"
+CRED_JSON="$STATE_DIR/credentials.json"
+ADOPTED_FLAG="$STATE_DIR/adopted.ok"
+DISCOVERABLE_FLAG="$STATE_DIR/discoverable.on"
+ADOPT_TOKEN_FILE="$STATE_DIR/adoption.token"
+
+discover_from_cfg() {
+  uci -q get remote_agent.controller_url
+}
+
+discover_from_dhcp114() {
+  [ -r "$STATE_DIR/dhcp114.url" ] && cat "$STATE_DIR/dhcp114.url"
+}
+
+controller_url() {
+  url="$(discover_from_cfg)"
+  [ -n "$url" ] && { echo "$url"; return; }
+  url="$(discover_from_dhcp114)"
+  [ -n "$url" ] && { echo "$url"; return; }
+  echo ""
+}
+
+payload() {
+  host="$(uci -q get system.@system[0].hostname || echo openwrt)"
+  board="$(jsonfilter -i /etc/board.json -e '@.model.id' 2>/dev/null || cat /tmp/sysinfo/board_name 2>/dev/null)"
+  mac="$(ip link show br-lan 2>/dev/null | awk '/link\/ether/{print $2}' || ip link show eth0 2>/dev/null | awk '/link\/ether/{print $2}')"
+  ip="$(ip -4 addr show br-lan 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
+  [ -z "$ip" ] && ip="$(ip -4 addr show eth0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
+  if [ -r "$CRED_JSON" ]; then
+    user="$(jsonfilter -s "$(cat "$CRED_JSON")" -e '@.username')"
+    pass="$(jsonfilter -s "$(cat "$CRED_JSON")" -e '@.password')"
+  fi
+  cat <<EOF
+{"hostname":"$host","board":"$board","mac":"$mac","ip":"$ip","username":"$user","password":"$pass","ubus_path":"/ubus"}
+EOF
+}
+
+post_json() {
+  url="$1"; data="$2"; ca="$(uci -q get remote_agent.ca || echo /etc/ssl/certs/ca-certificates.crt)"
+  if command -v uclient-fetch >/dev/null; then
+    printf '%s' "$data" | uclient-fetch -q -T 30 -O - --post-data - --ca-certificate "$ca" "$url"
+  else
+    curl --fail --silent --show-error --max-time 30 --cacert "$ca" -H 'Content-Type: application/json' -d "$data" "$url"
+  fi
+}
+
+enable_discoverable() {
+  : > "$DISCOVERABLE_FLAG"
+  token="$(cat "$ADOPT_TOKEN_FILE" 2>/dev/null)"
+  host="$(uci -q get system.@system[0].hostname || echo openwrt)"
+  port="$(uci -q get uhttpd.main.listen_https | sed 's/.*://;t;d')"
+  [ -n "$port" ] || port="80"
+  /etc/init.d/umdns start >/dev/null 2>&1 || true
+  ubus -S call umdns register "$(printf '{"name":"_owrt-prov._tcp","port":%s,"txt":["host=%s","user=remote_agent","path=/ubus","adopt=1","token=%s"]}' "$port" "$host" "$token")" >/dev/null 2>&1 || true
+  logger -t remote-agent "Discoverable mode enabled; mDNS (_owrt-prov._tcp)"
+}
+
+rotate_to_shadow_local() {
+  RESP="$1"
+  newpass="$(jsonfilter -s "$RESP" -e '@.new_password' 2>/dev/null)"
+  [ -z "$newpass" ] && return 0
+  token="$(cat "$ADOPT_TOKEN_FILE" 2>/dev/null)"
+  [ -z "$token" ] && token="local"
+  ubus call provision adopt "$(printf '{"adoption_token":"%s","new_password":"%s"}' "$token" "$newpass")" >/dev/null 2>&1 || true
+}
+
+wait_for_net() {
+  for i in $(seq 1 20); do ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0 || sleep 3; done
+  return 0
+}
+
+start_service() {
+  [ -f "$ADOPTED_FLAG" ] && return 0
+  procd_open_instance
+  procd_set_param respawn 300 5 5
+  procd_set_param command /bin/sh -c '
+    set -e
+    wait_for_net
+
+    URL="$(controller_url)"
+    if [ -n "$URL" ]; then
+      DATA="$(payload)"
+      RESP="$(post_json "$URL" "$DATA" || true)"
+      if [ -n "$RESP" ]; then
+        rotate_to_shadow_local "$RESP"
+        exit 0
+      fi
+    fi
+
+    enable_discoverable
+    sleep "$(uci -q get remote_agent.interval || echo 300)"
+    exit 0
+  '
+  procd_close_instance
+}
