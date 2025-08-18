@@ -1,4 +1,4 @@
 config remote-agent 'config'
-	option controller_url 'https://192.168.1.1/cgi-bin/remote-controller/enroll'
+#	option controller_url 'https://192.168.1.1/cgi-bin/remote-controller/enroll'
 	option ca  '/etc/ssl/certs/ca-certificates.crt'
-	option interval '300'
+	option poll_interval '300'

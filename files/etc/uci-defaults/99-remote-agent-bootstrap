@@ -1,12 +1,14 @@
 #!/bin/sh
 
 set -e
-RPC_USER="remote_agent"
-STATE_DIR="/etc/remote-agent"
-CRED_JSON="$STATE_DIR/credentials.json"
-# shellcheck disable=SC2034
-ADOPTED_FLAG="$STATE_DIR/adopted.ok"
-ADOPT_TOKEN_FILE="$STATE_DIR/adoption.token"
+
+readonly raFunctions='/usr/lib/remote-agent/functions.sh'
+if [ -s "$raFunctions" ]; then
+# shellcheck source=../../usr/lib/remote-agent/functions.sh
+	. "$raFunctions"
+else
+	logger -t 'remote-agent' 'error' "Remote-Agent Functions file ($raFunctions) not found!"
+fi
 
 mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
 
@@ -31,17 +33,17 @@ chmod 600 "$CRED_JSON"
 
 # Ensure /ubus is exposed
 uci -q show uhttpd | grep -q "ubus_prefix='/ubus'" || {
-  uci add_list uhttpd.main.ubus_prefix='/ubus'
-  uci commit uhttpd
-  /etc/init.d/uhttpd restart || true
+	uci add_list uhttpd.main.ubus_prefix='/ubus'
+	uci commit uhttpd
+	/etc/init.d/uhttpd restart || true
 }
 
 /etc/init.d/rpcd restart >/dev/null 2>&1 || true
 
 # Pre-generate an adoption token used in discoverable mode (one-time)
 if [ ! -s "$ADOPT_TOKEN_FILE" ]; then
-  dd if=/dev/urandom bs=18 count=1 2>/dev/null | base64 | tr -d '\n=/' | cut -c1-24 > "$ADOPT_TOKEN_FILE"
-  chmod 600 "$ADOPT_TOKEN_FILE"
+	dd if=/dev/urandom bs=18 count=1 2>/dev/null | base64 | tr -d '\n=/' | cut -c1-24 > "$ADOPT_TOKEN_FILE"
+	chmod 600 "$ADOPT_TOKEN_FILE"
 fi
 
 exit 0
