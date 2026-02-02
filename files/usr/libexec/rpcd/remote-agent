@@ -1,44 +1,36 @@
-#!/bin/sh
-# Implements list|call and supports discoverable adoption.
-set -e
+#!/usr/bin/ucode -R
+'use strict';
 
-readonly raFunctions='/usr/lib/remote-agent/functions.sh'
-if [ -s "$raFunctions" ]; then
-# shellcheck source=../../lib/remote-agent/functions.sh
-	. "$raFunctions"
-else
-	logger -t 'remote-agent' 'error' "Remote-Agent Functions file ($raFunctions) not found!"
-fi
+function ok(obj) { return { code: 0, data: obj }; }
 
-case "$1" in
-  list)
-    {
-      echo '{'
-      echo '"_core":'
-      core_list
-      for s in "$EXT_DIR"/*; do
-        [ -x "$s" ] || continue
-        echo ',"_ext_'"$(basename "$s")"'":'
-        "$s" list 2>/dev/null || echo '{}'
-      done
-      echo '}'
-    }
-    ;;
-  call)
-    m="$2"
-    read_stdin
-    case "$m" in
-      ping) jout '{"ok":true,"name":"provision"}' ;;
-      reboot) do_reboot ;;
-      passwd) do_passwd ;;
-      uci) do_uci ;;
-      service) do_service ;;
-      wifi) do_wifi ;;
-      pkg) do_pkg ;;
-      bootstrap_info) do_bootstrap_info ;;
-      adopt) do_adopt ;;
-      *) if ! ext_call "$m"; then err "unknown method"; fi ;;
-    esac
-    ;;
-  *) echo "Usage: $0 list|call <method>" >&2; exit 2 ;;
-esac
+let M = {};
+
+M["remote.agent"] = {
+	"capabilities.list": function (req) {
+		return ok({ enrollment: true, report: true, session_pull_only: true });
+	},
+	"session_pull_only": function (req) {
+		let val = req && (req.enable === true || req.enable === 1) ? 1 : 0;
+		// Transient change could be stored in /tmp, but for MVP we just echo
+		return ok({ applied: true, persisted: false, value: val });
+	},
+	"report.get": function (req) {
+		let device_id = (fs.readfile("/etc/remote-agent/uuid") || "").trim();
+		let now = new (Date()).toISOString();
+		// TODO: collect real data via ubus/iwinfo
+		let payload = {
+			schema_version: "1.0",
+			agent_version: "remote-agent 0.1.0",
+			device_id: device_id,
+			ts: now,
+			system: { hostname: "openwrt", uptime_s: 0, board: "", release: "", kernel: "", pkgmgr: {opkg:true, apk:false} },
+			interfaces: [],
+			wifi: [],
+			warnings: [],
+			errors: []
+		};
+		return ok(payload);
+	}
+};
+
+rpcd.register_object(M);

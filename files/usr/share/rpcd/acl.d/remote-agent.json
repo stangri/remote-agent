@@ -1,7 +1,44 @@
 {
   "remote-agent": {
-    "description": "Remote agent provisioning API",
-    "read":  { "ubus": { "provision": [ "ping", "bootstrap_info" ] } },
-    "write": { "ubus": { "provision": [ "passwd", "uci", "service", "wifi", "reboot", "pkg", "adopt" ] } }
+    "description": "ACL for remote-agent ubus object and required reads",
+    "read": {
+      "ubus": {
+        "remote.agent": [
+          "capabilities.list",
+          "report.get",
+          "session_pull_only"
+        ],
+        "system": [
+          "*"
+        ],
+        "network": [
+          "*"
+        ],
+        "iwinfo": [
+          "*"
+        ],
+        "hostapd.*": [
+          "get_clients"
+        ]
+      },
+      "file": {
+        "/etc/remote-agent/uuid": [
+          "read"
+        ],
+        "/etc/openwrt_version": [
+          "read"
+        ],
+        "/tmp/sysinfo/board_name": [
+          "read"
+        ]
+      }
+    },
+    "write": {
+      "ubus": {
+        "remote.agent": [
+          "session_pull_only"
+        ]
+      }
+    }
   }
 }

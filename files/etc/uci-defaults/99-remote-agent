@@ -1,0 +1,6 @@
+#!/bin/sh
+# First-boot defaults for remote-agent
+# shellcheck source=../../etc/init.d/remote-agent
+. /etc/init.d/remote-agent
+system_healthcheck
+exit 0

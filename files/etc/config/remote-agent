@@ -1,4 +1,18 @@
-config remote-agent 'config'
-#	option controller_url 'https://192.168.1.1/cgi-bin/remote-controller/enroll'
-	option ca  '/etc/ssl/certs/ca-certificates.crt'
-	option poll_interval '300'
+config agent 'main'
+  option device_id 'auto'
+  option enrollment_user_password ''
+  option enrollment_user_password_hash ''
+
+  option remote_controller_url ''
+  option discovered_controller_url ''
+  option enrolled_controller_url ''
+  option enrolled_controller_id ''
+
+  option enrollment_push_frequency '120'
+  option session_push_frequency '120'
+
+  list   enrollment_allowed_protocol 'http'
+  list   enrollment_allowed_protocol 'https'
+  list   enrollment_allowed_interface 'lan'
+
+  option session_pull_only '0'

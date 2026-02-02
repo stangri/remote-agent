@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright 2017-2025 MOSSDeF, Stan Grishin (stangri@melmac.ca).
+# Copyright 2025-2026 MOSSDeF, Stan Grishin (stangri@melmac.ca).
 
 include $(TOPDIR)/rules.mk
 
@@ -28,16 +28,12 @@ define Package/remote-agent/install
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/remote-agent $(1)/etc/config/remote-agent
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/etc/init.d/remote-agent-enroll $(1)/etc/init.d/remote-agent-enroll
+	$(INSTALL_BIN) ./files/etc/init.d/remote-agent $(1)/etc/init.d/remote-agent
 	$(SED) "s|^\(readonly PKG_VERSION\).*|\1='$(PKG_VERSION)-r$(PKG_RELEASE)'|" $(1)/etc/init.d/remote-agent-enroll
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-remote-agent $(1)/etc/uci-defaults/99-remote-agent
 	$(INSTALL_DIR) $(1)/usr/share/ucode/remote-agent
 	$(INSTALL_DATA) ./files/usr/share/ucode/remote-agent/adopt.uc $(1)/usr/share/ucode/remote-agent/adopt.uc
-	$(INSTALL_DIR) $(1)/usr/lib/remote-agent
-	$(INSTALL_BIN) ./usr/lib/remote-agent/functions.sh $(1)/usr/lib/remote-agent/functions.sh
-	$(INSTALL_DIR) $(1)/usr/libexec/remote-agent
-	$(INSTALL_BIN) ./usr/libexec/remote-agent/enroll-runner $(1)/usr/libexec/remote-agent/enroll-runner
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd/remote-agent
 	$(INSTALL_BIN) ./usr/libexec/rpcd/remote-agent $(1)/usr/libexec/rpcd/remote-agent
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd/remote-agent.d

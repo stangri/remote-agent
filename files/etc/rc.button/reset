@@ -1,0 +1,9 @@
+#!/bin/sh
+[ "$BUTTON" = "reset" ] || exit 0
+case "$ACTION" in
+	released)
+		if [ "${SEEN:-0}" -ge 5 ]; then
+			/etc/init.d/remote-agent reset_adoptable
+		fi
+	;;
+esac

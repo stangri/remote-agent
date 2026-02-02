@@ -1,0 +1,8 @@
+#!/bin/sh
+# udhcpc default-script.d hook for remote-agent
+[ -n "$opt114" ] || exit 0
+case "$opt114" in
+	http://*|https://*)
+		/etc/init.d/remote-agent dhcp114 "$opt114"
+	;;
+esac

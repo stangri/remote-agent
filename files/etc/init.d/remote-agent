@@ -1,0 +1,468 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Remote Agent (enroll) init script
+
+# shellcheck disable=SC2015,SC3043
+
+# shellcheck disable=SC2034
+START=20
+# shellcheck disable=SC2034
+USE_PROCD=1
+
+PKG="remote-agent"
+CFG="remote-agent"
+SECTION="main"
+
+STATE_DIR="/tmp/remote-agent/state"
+DATA_DIR="/tmp/remote-agent/data"
+ETC_DIR="/etc/remote-agent"
+UUID_FILE="$ETC_DIR/uuid"
+PWHASH_FILE="$ETC_DIR/password_hash"
+
+# Extra commands
+extra_command 'dhcp114' 'Handle DHCP option 114 URL for controller discovery'
+extra_command 'reset_adoptable' 'Reset agent to adoptable state (clear adoption, regenerate bootstrap password)'
+extra_command 'enroll_now' 'Force an immediate enrollment attempt'
+extra_command 'iface_event' 'Trigger an immediate enrollment try on interface/link change'
+extra_command 'enroll_loop_proc' 'Run enrollment loop (procd-managed)'
+extra_command 'report_loop_proc' 'Run reporting loop (procd-managed)'
+extra_command 'on_firewall_reload' 'Reconcile service after firewall reload'
+extra_command 'on_interface_reload' 'Reconcile service after interface reload'
+
+# Flags
+_RA_FW_TOUCHED=0
+_RA_PORTS=
+
+# Global config cache (populated by load_config)
+enrollment_allowed_interface=
+enrollment_allowed_protocol=
+enrolled_controller_url=
+enrolled_controller_id=
+discovered_controller_url=
+device_id=
+enrollment_user_password=
+enrollment_user_password_hash=
+session_pull_only='0'
+session_push_frequency='120'
+enrollment_push_frequency='120'
+remote_controller_url=
+
+# shellcheck disable=SC1091
+. /lib/functions.sh
+# shellcheck disable=SC1091
+. /lib/functions/network.sh
+# shellcheck disable=SC1091
+. /usr/share/libubox/jshn.sh
+
+# ---- Load UCI config (read-only cache) ----
+load_config() {
+	local section="$SECTION"
+	config_load "$CFG"
+
+	# Strings / lists
+	config_get enrollment_allowed_interface  "$section" enrollment_allowed_interface
+	config_get enrollment_allowed_protocol   "$section" enrollment_allowed_protocol
+	config_get enrolled_controller_url       "$section" enrolled_controller_url
+	config_get enrolled_controller_id        "$section" enrolled_controller_id
+	config_get discovered_controller_url     "$section" discovered_controller_url
+	config_get device_id                     "$section" device_id
+	config_get enrollment_user_password      "$section" enrollment_user_password
+	config_get enrollment_user_password_hash "$section" enrollment_user_password_hash
+	config_get remote_controller_url         "$section" remote_controller_url
+
+	# Bools
+	config_get_bool session_pull_only    "$section" session_pull_only '0'
+
+	# Numbers
+	config_get session_push_frequency    "$section" session_push_frequency '120'
+	config_get enrollment_push_frequency "$section" enrollment_push_frequency '120'
+}
+
+log() { logger -t "$PKG" "$*"; }
+
+# ---- UUID helpers ----
+gen_uuid() {
+	[ -r /proc/sys/kernel/random/uuid ] && cat /proc/sys/kernel/random/uuid && return
+	hexdump -n16 -e '4/4 "%08x" 1 "\n"' /dev/urandom | sed -e 's/^\(........\)\(....\)\(....\)\(....\)\(..............\)$/\1-\2-\3-\4-\5/'
+}
+
+ra_contains_word() {
+    local haystack="$1" needle="$2"
+    for w in $haystack; do
+        [ "$w" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+# ----- Jitter helpers -----
+ra_rand_int() {
+    # returns 0..32767
+    od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ' | awk '{print $1 % 32768}'
+}
+
+ra_jittered_sleep() {
+    # base seconds from config: enrollment_push_frequency
+    # jitter +-10%
+    local base r jitter delta s
+		base="${enrollment_push_frequency:-120}"
+    [ -n "$base" ] || base=120
+    r="$(ra_rand_int)"
+    # scale to [-10, +10]
+    jitter=$(( (r % 21) - 10 ))
+    # compute sleep = base + (base * jitter / 100)
+    delta=$(( (base * jitter) / 100 ))
+    s=$(( base + delta ))
+    [ "$s" -lt 5 ] && s=5
+    sleep "$s"
+}
+
+# Apply $6$ hash into /etc/shadow for 'remote-agent' user
+ra_apply_hash() {
+	local h="$1"
+	if ! grep -q '^remote-agent:' /etc/passwd 2>/dev/null; then
+		adduser -D -H -S -s /bin/false remote-agent 2>/dev/null || true
+	fi
+	if ! grep -q '^remote-agent:' /etc/shadow 2>/dev/null; then
+		echo "remote-agent:*:0:0:99999:7:::" >> /etc/shadow
+	fi
+	awk -v h="$h" -F: 'BEGIN{OFS=":"} $1=="remote-agent"{$2=h} {print}' /etc/shadow > /tmp/.shadow.$$ && cat /tmp/.shadow.$$ > /etc/shadow && rm -f /tmp/.shadow.$$
+}
+
+# Compute allowed ports from config (http/https)
+ra_compute_ports() {
+	_RA_PORTS=""
+	local prot
+	for prot in $enrollment_allowed_protocol; do
+		case "$prot" in
+			http)  _RA_PORTS="${_RA_PORTS:+$_RA_PORTS 80}" ;;
+			https) _RA_PORTS="${_RA_PORTS:+$_RA_PORTS 443}" ;;
+		esac
+	done
+}
+
+# Resolve firewall zone from logical network name
+ra_zone_for_net() {
+	local net="$1"
+	local i=0 name nets
+	while name="$(uci_get "firewall" "@zone[$i]" "name")"; do
+		nets="$(uci_get "firewall" "@zone[$i]" "network")"
+		ra_contains_word "$nets" "$net" && { echo "$name"; return 0; }
+		i=$((i+1))
+	done
+	return 1
+}
+
+# Get device name for logical network (best-effort)
+ra_ifname_for_net() {
+	local net="$1"
+	uci_get "network" "$net" "ifname"
+}
+
+# List IPs for a given dev & family
+ra_ips_for_dev() {
+	local dev="$1" fam="$2"
+	[ -n "$dev" ] || return 0
+	case "$fam" in
+		v4) ip -4 -o addr show dev "$dev" | awk '{print $4}' | cut -d/ -f1 ;;
+		v6) ip -6 -o addr show dev "$dev" | awk '{print $4}' | cut -d/ -f1 ;;
+	esac
+}
+
+# Emit one ACCEPT rule object into procd data JSON
+ra_fw_rule_accept() {
+	local zone="$1" fam="$2" ip="$3" port="$4"
+	_RA_FW_TOUCHED=1
+	json_add_object ""
+		json_add_string type "rule"
+		json_add_string src  "$zone"
+		json_add_string proto "tcp"
+		[ "$fam" = "v4" ] && json_add_string family "ipv4" || json_add_string family "ipv6"
+		json_add_string dest_ip   "$ip"
+		json_add_string dest_port "$port"
+		json_add_string target    "ACCEPT"
+	json_close_object
+}
+
+# Iterate nets × families × IPs × ports and emit rules
+ra_emit_fw_rules() {
+	local nets net dev zone fam ip p
+	nets="$enrollment_allowed_interface"
+	[ -n "$nets" ] || nets="lan"
+	for net in $nets; do
+		dev="$(ra_ifname_for_net "$net")"
+		zone="$(ra_zone_for_net "$net")" || continue
+		for fam in v4 v6; do
+			for ip in $(ra_ips_for_dev "$dev" "$fam"); do
+				for p in $_RA_PORTS; do
+					ra_fw_rule_accept "$zone" "$fam" "$ip" "$p"
+				done
+			done
+		done
+	done
+}
+
+# Token handling (MVP: include whenever not adopted)
+ra_compute_mdns_and_token() {
+	local P="$enrollment_user_password"
+	local enrolled_url="$enrolled_controller_url"
+	if [ -z "$P" ] && [ -n "$enrolled_url" ]; then
+		# adopted
+		: > "$STATE_DIR/token"
+	else
+		hexdump -n16 -e '4/4 "%08x"' /dev/urandom > "$STATE_DIR/token"
+	fi
+}
+
+# ----- Controller URL selection -----
+ra_select_controller_url() {
+    echo "${remote_controller_url:-$discovered_controller_url}"
+}
+
+# ----- Single enrollment attempt (reachability + placeholder POST) -----
+ra_enrollment_try_once() {
+    load_config
+    # Only attempt when adoptable (plaintext present)
+    if [ -z "$enrollment_user_password" ]; then
+        return 0
+    fi
+    local url; url="$(ra_select_controller_url)" || true
+    [ -n "$url" ] || return 0
+
+    # Basic reachability probe (HEAD/GET)
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSIL --max-time 5 --retry 0 "$url" >/dev/null 2>&1 || {
+            log "Controller not reachable at: $url"
+            return 0
+        }
+    fi
+
+    # Placeholder enrollment push (to be replaced with real RPC/endpoint)
+    # For MVP, just log success; controller adopts via local endpoint or future API.
+    log "Controller reachable at: $url (enrollment push loop placeholder)"
+}
+
+# State predicates
+is_adoptable() { [ -n "$enrollment_user_password" ]; }
+is_adopted()   { [ -z "$enrollment_user_password" ] && [ -n "$enrolled_controller_url" ]; }
+
+# Build uhttpd args for adopt endpoint (bind only on allowed-interface IPs)
+ra_build_uhttpd_adopt_args() {
+	local args="-f -h /dev/null -U /usr/share/ucode/remote-agent/adopt.uc"
+	local nets net dev ip
+	ra_compute_ports
+	nets="$enrollment_allowed_interface"
+	[ -n "$nets" ] || nets="lan"
+	for net in $nets; do
+		dev="$(ra_ifname_for_net "$net")"
+		[ -n "$dev" ] || continue
+		# IPv4 binds (keep IPv6 for a future pass)
+		if ra_contains_word "$_RA_PORTS" 80; then
+			for ip in $(ra_ips_for_dev "$dev" v4); do
+				args="$args -p ${ip}:80"
+			done
+		fi
+		if ra_contains_word "$_RA_PORTS" 443; then
+			for ip in $(ra_ips_for_dev "$dev" v4); do
+				# use default uhttpd keys if present; arguments still valid even if keys are absent (uhttpd will error if missing)
+				args="$args -s ${ip}:443 -C /etc/uhttpd.crt -K /etc/uhttpd.key"
+			done
+		fi
+	done
+	printf "%s" "$args"
+}
+
+# Generate/reset bootstrap password and hash
+ra_gen_bootstrap_password() {
+	local pw="$1"
+	[ -n "$pw" ] || pw="$(head -c 18 /dev/urandom | base64 | tr -d '=+/|')"
+	uci_set "$CFG" "$SECTION" "enrollment_user_password" "$pw"
+	uci_commit "$CFG"
+	# SHA-512 crypt via openssl (requires openssl-util)
+	local salt h
+	salt="$(hexdump -n6 -e '6/1 "%02x"' /dev/urandom)"
+	h="$(openssl passwd -6 -salt "$salt" "$pw")"
+	echo "$h" > "$PWHASH_FILE"
+	uci_remove "$CFG" "$SECTION" "enrollment_user_password_hash" 2>/dev/null
+	uci_commit "$CFG"
+	ra_apply_hash "$h"
+}
+
+# system_healthcheck
+system_healthcheck() {
+	mkdir -p "$ETC_DIR" "$STATE_DIR" "$DATA_DIR"
+
+	# UUID
+	local uuid udev
+	if [ ! -s "$UUID_FILE" ]; then
+		uuid="$(gen_uuid)"
+		echo "$uuid" > "$UUID_FILE"
+		log "Generated new UUID $uuid"
+	else
+		uuid="$(cat "$UUID_FILE")"
+	fi
+	udev="$device_id"
+	if [ -z "$udev" ] || [ "$udev" = "auto" ]; then
+		uci_set "$CFG" "$SECTION" "device_id" "$uuid"
+		uci_commit "$CFG"
+	fi
+
+	# Password/hash reconciliation
+	local P H_uci H_file
+	P="$enrollment_user_password"
+	H_uci="$enrollment_user_password_hash"
+	[ -s "$PWHASH_FILE" ] && H_file="$(cat "$PWHASH_FILE")" || H_file=""
+
+	if [ -z "$P" ] && [ -z "$H_uci" ] && [ -z "$H_file" ]; then
+		ra_gen_bootstrap_password ""
+		log "WARN: missing creds; regenerated bootstrap password"
+	elif [ -z "$P" ] && [ -z "$H_uci" ] && [ -n "$H_file" ]; then
+		uci_set "$CFG" "$SECTION" "enrollment_user_password_hash" "$H_file"
+		uci_commit "$CFG"
+		ra_apply_hash "$H_file"
+		log "WARN: restored hash from file into UCI"
+	elif [ -z "$P" ] && [ -n "$H_uci" ] && [ -n "$H_file" ]; then
+		if [ "$H_uci" != "$H_file" ]; then
+			uci_set "$CFG" "$SECTION" "enrollment_user_password_hash" "$H_file"
+			uci_commit "$CFG"
+			ra_apply_hash "$H_file"
+			log "WARN: hash mismatch; restored from file"
+		else
+			ra_apply_hash "$H_file"
+		fi
+	else
+		# Plaintext present (adoptable or reset)
+		ra_gen_bootstrap_password "$P"
+	fi
+}
+
+start_service() {
+	load_config
+	system_healthcheck
+	load_config
+	mkdir -p "$DATA_DIR" "$STATE_DIR"
+
+	# Instance 1: adopt uhttpd (only if adoptable and no user-set remote_controller_url)
+	if is_adoptable && [ -z "$remote_controller_url" ]; then
+        ra_compute_ports
+        ra_compute_mdns_and_token
+        local PROG="/usr/sbin/uhttpd"
+        local PROG_PARAM
+        PROG_PARAM="$(ra_build_uhttpd_adopt_args)"
+
+        procd_open_instance adopt
+        procd_set_param command "$PROG" $PROG_PARAM
+        procd_set_param stderr 1
+        procd_set_param stdout 1
+        procd_set_param respawn
+
+        procd_open_data
+            json_add_object mdns
+                ra_contains_word "$_RA_PORTS" 80 && procd_add_mdns_service "remote-agent" "tcp" "80" "Remote Agent Adopt"
+                ra_contains_word "$_RA_PORTS" 443 && procd_add_mdns_service "remote-agent-tls" "tcp" "443" "Remote Agent Adopt TLS"
+            json_close_object
+
+            json_add_array firewall
+                ra_emit_fw_rules
+            json_close_array
+        procd_close_data
+        procd_close_instance
+    fi
+
+	# Instance 2: enrollment loop (only if adoptable and we have a controller URL)
+	if is_adoptable && [ -n "$(ra_select_controller_url)" ]; then
+        local PROG="/etc/init.d/remote-agent"
+        local PROG_PARAM="enroll_loop_proc"
+        procd_open_instance enroll
+        procd_set_param command "$PROG" $PROG_PARAM
+        procd_set_param stderr 1
+        procd_set_param stdout 1
+        procd_set_param respawn
+        procd_close_instance
+    fi
+
+	# Instance 3: reporting loop (only if adopted and push mode)
+	if is_adopted && [ "$session_pull_only" != "1" ]; then
+        local PROG="/etc/init.d/remote-agent"
+        local PROG_PARAM="report_loop_proc"
+        procd_open_instance report
+        procd_set_param command "$PROG" $PROG_PARAM
+        procd_set_param stderr 1
+        procd_set_param stdout 1
+        procd_set_param respawn
+        procd_close_instance
+    fi
+
+	# procd triggers so reload reconciles
+	procd_add_reload_trigger network
+}
+
+stop_service() {
+	: # procd will stop all instances
+}
+
+is_fw4_restart_needed() { [ "$_RA_FW_TOUCHED" -eq 1 ]; }
+service_started() { is_fw4_restart_needed && procd_set_config_changed firewall; }
+service_stopped() { is_fw4_restart_needed && procd_set_config_changed firewall; }
+
+dhcp114() {
+	local url="$1"
+	[ -n "$url" ] || return 0
+	uci_set "$CFG" "$SECTION" "discovered_controller_url" "$url"
+	uci_commit "$CFG"
+	log "DHCP 114 discovered controller URL: $url"
+}
+
+iface_event() {
+    # Called from hotplug to trigger an immediate enrollment try on link changes
+    # Usage: iface_event <ifname> <action>
+    ra_enrollment_try_once
+}
+
+reset_adoptable() {
+	uci_remove "$CFG" "$SECTION" "enrolled_controller_url"
+	uci_remove "$CFG" "$SECTION" "enrolled_controller_id"
+	uci_remove "$CFG" "$SECTION" "enrollment_user_password_hash"
+	uci_commit "$CFG"
+	ra_gen_bootstrap_password ""
+	log "Reset to adoptable (button long-press)"
+	reload_service
+}
+
+enroll_now() {
+	# Placeholder: immediate adopt POST if we have a controller URL
+	:
+}
+
+on_firewall_reload() {
+    # Called by fw4 reload hooks if configured; reconcile bindings and fw rules
+    reload_service
+}
+
+on_interface_reload() {
+    # Called by netifd reload hooks; try enrollment and reconcile mdns/firewall
+    ra_enrollment_try_once
+    reload_service
+}
+
+enroll_loop_proc() {
+	while :; do
+		ra_enrollment_try_once
+		ra_jittered_sleep
+	done
+}
+
+report_loop_proc() {
+	while :; do
+		load_config
+		if ! is_adopted || [ "$session_pull_only" = "1" ]; then
+			sleep "${session_push_frequency:-120}"
+			continue
+		fi
+		# Placeholder push to controller; actual POST to be implemented
+		if command -v ubus >/dev/null 2>&1; then
+			ubus call remote.agent report.get >/dev/null 2>&1 || true
+		fi
+		log "Report push placeholder to $enrolled_controller_url"
+		sleep "${session_push_frequency:-120}"
+	done
+}
