@@ -134,8 +134,8 @@ ra_compute_ports() {
 	local prot
 	for prot in $enrollment_allowed_protocol; do
 		case "$prot" in
-			http)  _RA_PORTS="${_RA_PORTS:+$_RA_PORTS 80}" ;;
-			https) _RA_PORTS="${_RA_PORTS:+$_RA_PORTS 443}" ;;
+			http)  _RA_PORTS="${_RA_PORTS:+${_RA_PORTS} 80}" ;;
+			https) _RA_PORTS="${_RA_PORTS:+${_RA_PORTS} 443}" ;;
 		esac
 	done
 }
@@ -215,7 +215,7 @@ ra_compute_mdns_and_token() {
 
 # ----- Controller URL selection -----
 ra_select_controller_url() {
-    echo "${remote_controller_url:-$discovered_controller_url}"
+    echo "${remote_controller_url:-${discovered_controller_url}}"
 }
 
 # ----- Single enrollment attempt (reachability + placeholder POST) -----
