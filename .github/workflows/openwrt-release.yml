@@ -3,9 +3,6 @@ permissions:
 name: Build OpenWrt Package
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
